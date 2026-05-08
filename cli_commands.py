@@ -24,6 +24,11 @@ class CommandType(Enum):
     COMPACT = "compact"
     TASK = "task"
     MEMORY = "memory"
+    SKILL = "skill"
+    VERIFY = "verify"
+    COMMIT = "commit"
+    DIFF = "diff"
+    FETCH = "fetch"
 
 
 @dataclass
@@ -105,6 +110,16 @@ class AdvancedCLICommands:
             return CommandType.TASK, user_input[6:].strip() if len(user_input) > 6 else ""
         elif user_input.startswith("/memory"):
             return CommandType.MEMORY, user_input[8:].strip() if len(user_input) > 8 else ""
+        elif user_input.startswith("/skill"):
+            return CommandType.SKILL, user_input[6:].strip() if len(user_input) > 6 else ""
+        elif user_input.startswith("/verify"):
+            return CommandType.VERIFY, user_input[8:].strip() if len(user_input) > 8 else ""
+        elif user_input.startswith("/commit"):
+            return CommandType.COMMIT, user_input[8:].strip() if len(user_input) > 8 else ""
+        elif user_input.startswith("/diff"):
+            return CommandType.DIFF, user_input[6:].strip() if len(user_input) > 6 else ""
+        elif user_input.startswith("/fetch"):
+            return CommandType.FETCH, user_input[7:].strip() if len(user_input) > 7 else ""
         return None
 
     async def execute_command(
@@ -127,6 +142,16 @@ class AdvancedCLICommands:
             return await self._execute_tasks(args)
         elif command == CommandType.MEMORY:
             return await self._execute_memory(args)
+        elif command == CommandType.SKILL:
+            return await self._execute_skill(args)
+        elif command == CommandType.VERIFY:
+            return await self._execute_verify(args)
+        elif command == CommandType.COMMIT:
+            return await self._execute_commit(args)
+        elif command == CommandType.DIFF:
+            return await self._execute_diff(args)
+        elif command == CommandType.FETCH:
+            return await self._execute_fetch(args)
         return {"status": "error", "message": "Unknown command"}
 
     async def _execute_loop(self, args: str) -> Dict[str, Any]:
@@ -372,6 +397,114 @@ Provide a structured review with:
         return {
             "status": "error",
             "message": "Memory system not initialized"
+        }
+
+    async def _execute_skill(self, args: str) -> Dict[str, Any]:
+        """执行技能命令"""
+        from skills import SkillManager
+        
+        manager = SkillManager()
+        
+        if not args:
+            return {
+                "status": "success",
+                "skills": manager.list_skills(),
+                "usage": "Usage: /skill <skill_name> [args]"
+            }
+        
+        parts = args.split()
+        skill_name = parts[0]
+        skill_args = " ".join(parts[1:]) if len(parts) > 1 else ""
+        
+        result = manager.execute_skill(skill_name, {"args": skill_args})
+        
+        return {
+            "status": result.status,
+            "skill": skill_name,
+            "output": result.output,
+            "execution_time": result.execution_time
+        }
+
+    async def _execute_verify(self, args: str) -> Dict[str, Any]:
+        """执行验证命令"""
+        verify_prompt = f"""Verify these changes:
+
+Files: {args or 'All changed files'}
+
+Verification steps:
+1. Run tests if available
+2. Check for syntax errors
+3. Verify functionality
+4. Report issues found
+
+Be skeptical - investigate any failures."""
+        
+        result = await self.agent_system.run(verify_prompt, agent_type="writer_reviewer")
+        
+        return {
+            "status": "verified",
+            "result": result.get("output", result)
+        }
+
+    async def _execute_commit(self, args: str) -> Dict[str, Any]:
+        """执行提交命令"""
+        commit_prompt = f"""Create a git commit:
+
+Changes: {args or 'Current changes'}
+
+Follow these guidelines:
+1. Create a meaningful commit message
+2. Stage changed files
+3. Execute the commit
+4. Report the commit hash
+
+Commit message format:
+- Short subject line (max 50 chars)
+- Body with details (optional)
+- Reference issues if applicable"""
+        
+        result = await self.agent_system.run(commit_prompt, agent_type="claude")
+        
+        return {
+            "status": "committed",
+            "result": result.get("output", result)
+        }
+
+    async def _execute_diff(self, args: str) -> Dict[str, Any]:
+        """执行差异对比命令"""
+        diff_prompt = f"""Show git diff:
+
+Files: {args or 'All files'}
+
+Show changes made, highlight important modifications, and summarize what changed."""
+        
+        result = await self.agent_system.run(diff_prompt, agent_type="claude")
+        
+        return {
+            "status": "diff",
+            "result": result.get("output", result)
+        }
+
+    async def _execute_fetch(self, args: str) -> Dict[str, Any]:
+        """执行网页抓取命令"""
+        if not args:
+            return {
+                "status": "error",
+                "message": "Usage: /fetch <url>"
+            }
+        
+        fetch_prompt = f"""Fetch and summarize this URL:
+
+URL: {args}
+
+Provide a summary of the content and key information found."""
+        
+        result = await self.agent_system.run(fetch_prompt, agent_type="claude")
+        
+        return {
+            "status": "fetched",
+            "url": args,
+            "result": result.get("output", result)
         }
 
     def get_status(self) -> Dict[str, Any]:
