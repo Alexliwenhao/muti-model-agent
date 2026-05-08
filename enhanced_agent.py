@@ -5,6 +5,10 @@
 - LangChain ReAct Agent
 - 子代理系统
 - Claude Code 工具集
+- MCP 支持
+- 持久化记忆系统
+- 高级 CLI 命令
+- Writer/Reviewer 模式
 """
 from typing import Optional, Dict, Any, List
 import asyncio
@@ -16,6 +20,9 @@ from core.session import Session, SessionManager
 from agents import SubAgentManager, SubAgentConfig, SubAgentType
 from agents.langchain_agent import LangChainAgent, PlanAndExecuteAgent, ConversationalAgent
 from tools.langchain_tools import get_all_claude_code_tools
+from mcp import MCPClient, MCPIntegration
+from memory import MemorySystem, ClaudeMDManager, MemoryType
+from cli_commands import AdvancedCLICommands, WriterReviewerPattern
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +32,21 @@ class MultiModelAgentSystem:
 
     Claude Code 架构特点:
     1. 简单的 while(tool_call) 循环
-    2. 8个核心工具
+    2. 8个核心工具 + MCP 扩展
     3. 子代理隔离执行
     4. 上下文窗口管理
     5. 多模型协同
+    6. 持久化记忆
+    7. Writer/Reviewer 模式
     """
 
     def __init__(
         self,
         config: Optional[Config] = None,
         use_langchain: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
+        enable_mcp: bool = True,
+        enable_memory: bool = True
     ):
         self.config = config or Config()
         self.verbose = verbose
@@ -48,6 +59,19 @@ class MultiModelAgentSystem:
 
         self.session_manager = SessionManager()
         self.sub_agent_manager = SubAgentManager(self.config)
+
+        self.mcp_client = None
+        self.mcp_integration = None
+        if enable_mcp:
+            self._init_mcp()
+
+        self.memory_system = None
+        self.claude_md = None
+        if enable_memory:
+            self._init_memory()
+
+        self.cli_commands = AdvancedCLICommands(self)
+        self.writer_reviewer = WriterReviewerPattern(self)
 
         if use_langchain:
             tools = get_all_claude_code_tools()
@@ -69,8 +93,33 @@ class MultiModelAgentSystem:
             self.plan_agent = None
             self.conversational_agent = None
 
+    def _init_mcp(self):
+        """初始化 MCP"""
+        try:
+            self.mcp_client = MCPClient()
+            self.mcp_integration = MCPIntegration(self.mcp_client)
+            if self.verbose:
+                print("[MCP] Initialized")
+        except Exception as e:
+            if self.verbose:
+                print(f"[MCP] Initialization failed: {e}")
+
+    def _init_memory(self):
+        """初始化记忆系统"""
+        try:
+            self.memory_system = MemorySystem()
+            self.claude_md = ClaudeMDManager()
+            if not self.claude_md.exists():
+                self.claude_md.create_default()
+            if self.verbose:
+                print("[Memory] Initialized")
+        except Exception as e:
+            if self.verbose:
+                print(f"[Memory] Initialization failed: {e}")
+
     def _get_claude_code_system_prompt(self) -> str:
-        return """You are Claude Code, an AI coding assistant.
+        """获取 Claude Code 风格的系统提示"""
+        base_prompt = """You are Claude Code, an AI coding assistant.
 
 You have access to tools to interact with the filesystem and run commands:
 - Bash(command, cwd?, timeout?): Execute shell commands
@@ -90,6 +139,13 @@ Guidelines:
 6. Use TodoWrite to track multi-step tasks
 
 You are in a CLI environment. Work with the user's current directory."""
+
+        if self.memory_system:
+            context = self.memory_system.get_context_for_task("")
+            if context:
+                base_prompt += f"\n\n{context}"
+
+        return base_prompt
 
     def _get_langchain_system_prompt(self) -> str:
         return """You are a helpful AI assistant with access to powerful tools.
@@ -115,13 +171,7 @@ Guidelines:
         agent_type: str = "claude",
         sub_agents: bool = True
     ) -> Dict[str, Any]:
-        """Run task using selected agent type
-
-        Args:
-            task: Task to execute
-            agent_type: "claude", "langchain", "plan", or "conversational"
-            sub_agents: Whether to use sub-agents for complex tasks
-        """
+        """Run task using selected agent type"""
         session = self.session_manager.get_current_session()
         if not session:
             session = self.session_manager.create_session()
@@ -153,35 +203,39 @@ Guidelines:
         elif agent_type == "multi":
             return await self._run_multi_agent(task, sub_agents)
 
+        elif agent_type == "writer_reviewer":
+            return await self._run_writer_reviewer(task)
+
         return {"status": "error", "error": "Unknown agent type"}
 
     async def _run_multi_agent(self, task: str, use_sub_agents: bool) -> Dict[str, Any]:
         """Run task using multiple agents in collaboration"""
         results = {}
 
-        explore_config = SubAgentConfig(
-            name="CodeExplorer",
-            description="Explore codebase and find relevant files for: " + task,
-            agent_type=SubAgentType.EXPLORE,
-            tools=["Read", "Glob", "Grep"]
-        )
-
-        explore_agent = self.sub_agent_manager.create_sub_agent(explore_config)
-
-        primary_model = self.config.get_primary_model()
-        if primary_model.provider == "anthropic":
-            from langchain_anthropic import ChatAnthropic
-            llm = ChatAnthropic(
-                model=primary_model.model,
-                anthropic_api_key=primary_model.api_key
+        if use_sub_agents:
+            explore_config = SubAgentConfig(
+                name="CodeExplorer",
+                description="Explore codebase and find relevant files for: " + task,
+                agent_type=SubAgentType.EXPLORE,
+                tools=["Read", "Glob", "Grep"]
             )
-        else:
-            from langchain_openai import ChatOpenAI
-            llm = ChatOpenAI(model=primary_model.model, api_key=primary_model.api_key)
 
-        explore_result = await explore_agent.execute(task, llm)
-        self.sub_agent_manager.complete_agent(explore_agent.agent_id, explore_result)
-        results["explore"] = explore_result.summary
+            explore_agent = self.sub_agent_manager.create_sub_agent(explore_config)
+
+            primary_model = self.config.get_primary_model()
+            if primary_model.provider == "anthropic":
+                from langchain_anthropic import ChatAnthropic
+                llm = ChatAnthropic(
+                    model=primary_model.model,
+                    anthropic_api_key=primary_model.api_key
+                )
+            else:
+                from langchain_openai import ChatOpenAI
+                llm = ChatOpenAI(model=primary_model.model, api_key=primary_model.api_key)
+
+            explore_result = await explore_agent.execute(task, llm)
+            self.sub_agent_manager.complete_agent(explore_agent.agent_id, explore_result)
+            results["explore"] = explore_result.summary
 
         main_result = await self.claude_style_agent.run(task)
         results["main"] = {
@@ -196,6 +250,11 @@ Guidelines:
             "results": results,
             "sub_agents_used": use_sub_agents
         }
+
+    async def _run_writer_reviewer(self, task: str) -> Dict[str, Any]:
+        """Run task with Writer/Reviewer pattern"""
+        result = await self.writer_reviewer.implement_with_review(task)
+        return result
 
     async def run_sub_agent(
         self,
@@ -233,6 +292,26 @@ Guidelines:
             "execution_time": result.execution_time
         }
 
+    async def add_memory(
+        self,
+        content: str,
+        memory_type: str = "context",
+        tags: Optional[List[str]] = None
+    ):
+        """Add to memory"""
+        if self.memory_system:
+            self.memory_system.add_memory(
+                content=content,
+                memory_type=MemoryType(memory_type),
+                tags=tags
+            )
+
+    async def search_memory(self, query: str) -> List[Any]:
+        """Search memory"""
+        if self.memory_system:
+            return self.memory_system.search(query)
+        return []
+
     def _format_result(self, result: Any, agent_type: str) -> Dict[str, Any]:
         """Format result based on agent type"""
         if hasattr(result, "status"):
@@ -248,10 +327,10 @@ Guidelines:
 
     def get_status(self) -> Dict[str, Any]:
         """Get system status"""
-        return {
+        status = {
             "agent_type": "claude_code_architecture",
             "langchain_enabled": self.use_langchain,
-            "available_agents": ["claude", "langchain", "plan", "conversational", "multi"],
+            "available_agents": ["claude", "langchain", "plan", "conversational", "multi", "writer_reviewer"],
             "sub_agents": {
                 "active": self.sub_agent_manager.get_active_count(),
                 "completed": len(self.sub_agent_manager.get_results())
@@ -259,6 +338,16 @@ Guidelines:
             "sessions": len(self.session_manager.list_sessions()),
             "tools_available": self.claude_style_agent.get_available_tools()
         }
+
+        if self.mcp_client:
+            status["mcp"] = self.mcp_client.get_status()
+
+        if self.memory_system:
+            status["memory"] = self.memory_system.get_summary()
+
+        status["cli_commands"] = self.cli_commands.get_status()
+
+        return status
 
 
 async def main():
@@ -268,18 +357,31 @@ async def main():
     parser = argparse.ArgumentParser(description="Multi-Model Agent System")
     parser.add_argument("--task", "-t", type=str, help="Task to execute")
     parser.add_argument("--agent", "-a", type=str, default="claude",
-                       choices=["claude", "langchain", "plan", "conversational", "multi"],
+                       choices=["claude", "langchain", "plan", "conversational", "multi", "writer_reviewer"],
                        help="Agent type to use")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--no-mcp", action="store_true", help="Disable MCP")
+    parser.add_argument("--no-memory", action="store_true", help="Disable memory")
     args = parser.parse_args()
 
-    system = MultiModelAgentSystem(verbose=args.verbose)
+    system = MultiModelAgentSystem(
+        verbose=args.verbose,
+        enable_mcp=not args.no_mcp,
+        enable_memory=not args.no_memory
+    )
 
     print("=" * 60)
-    print("Multi-Model Agent System (Claude Code Architecture + LangChain)")
+    print("Multi-Model Agent System")
+    print("(Claude Code Architecture + LangChain + MCP + Memory)")
     print("=" * 60)
-    print(f"Available agents: {', '.join(system.get_status()['available_agents'])}")
-    print(f"Available tools: {len(system.get_status()['tools_available'])}")
+
+    status = system.get_status()
+    print(f"Available agents: {', '.join(status['available_agents'])}")
+    print(f"Available tools: {len(status['tools_available'])}")
+    if "mcp" in status:
+        print(f"MCP servers: {status['mcp'].get('total_tools', 0)} tools")
+    if "memory" in status:
+        print(f"Memory entries: {status['memory'].get('total_memories', 0)}")
     print("-" * 60)
 
     if args.task:
@@ -313,7 +415,15 @@ Commands:
   /tools         List available tools
   /session       Show current session
   /clear         Clear session
-  /agent <type>  Switch agent type (claude/langchain/plan/conversational/multi)
+  /agent <type>  Switch agent type
+  /loop <sec>    Start loop task
+  /btw <text>    Side question
+  /plan          Enter plan mode
+  /review <code> Code review
+  /compact       Compact context
+  /tasks         Manage tasks
+  /memory        Memory operations
+  /writer        Use Writer/Reviewer pattern
 
 Just type your task to start!
                     """)
@@ -321,27 +431,12 @@ Just type your task to start!
 
                 elif user_input.lower() == "/status":
                     import json
-                    print(json.dumps(system.get_status(), indent=2))
+                    print(json.dumps(system.get_status(), indent=2, default=str))
                     continue
 
-                elif user_input.lower() == "/agents":
-                    print(f"\nAvailable agents: {', '.join(system.get_status()['available_agents'])}")
-                    continue
-
-                elif user_input.lower() == "/tools":
-                    tools = system.get_status()['tools_available']
-                    print(f"\nAvailable tools ({len(tools)}):")
-                    for t in tools:
-                        print(f"  - {t}")
-                    continue
-
-                elif user_input.lower().startswith("/agent "):
-                    agent_type = user_input[7:].strip()
-                    if agent_type in system.get_status()['available_agents']:
-                        print(f"Agent type set to: {agent_type}")
-                        args.agent = agent_type
-                    else:
-                        print(f"Unknown agent type: {agent_type}")
+                elif user_input.lower().startswith("/"):
+                    cmd_result = await system.cli_commands.parse_and_execute(user_input)
+                    print(json.dumps(cmd_result, indent=2, default=str))
                     continue
 
                 result = await system.run(user_input, agent_type=args.agent)
