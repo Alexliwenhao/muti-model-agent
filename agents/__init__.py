@@ -1,10 +1,10 @@
 """Sub-Agent system for Multi-Model Agent
 
-Claude Code 子代理架构:
-- 子代理在独立上下文中运行
-- 只能返回摘要，防止上下文污染
-- 支持 Task tool 工具创建子代理
-- 深度限制为 1（子代理不能再创建子代理）
+Claude Code sub-agent architecture:
+- Sub-agents run in isolated contexts
+- Only return summaries to prevent context pollution
+- Support Task tool for creating sub-agents
+- Depth limit of 1 (sub-agents cannot create more sub-agents)
 """
 from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field
@@ -19,15 +19,19 @@ from config import Config, ModelConfig
 
 
 class SubAgentType(Enum):
-    EXPLORE = "explore"
-    PLAN = "plan"
-    GENERAL = "general"
+    """Built-in sub-agent types matching Claude Code"""
+    EXPLORE = "explore"       # One-shot: explore codebase
+    PLAN = "plan"             # One-shot: plan and analyze
+    GENERAL = "general"       # General purpose
     CODE_REVIEW = "code_review"
     RESEARCH = "research"
+    WORKER = "worker"         # Coordinator mode worker
+    VERIFICATION = "verification"  # Verify implementations
 
 
 @dataclass
 class SubAgentConfig:
+    """Sub-agent configuration"""
     name: str
     description: str
     agent_type: SubAgentType
@@ -35,6 +39,7 @@ class SubAgentConfig:
     tools: List[str] = field(default_factory=list)
     system_prompt: str = ""
     max_iterations: int = 50
+    is_one_shot: bool = False  # True for Explore, Plan types
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,12 +48,14 @@ class SubAgentConfig:
             "type": self.agent_type.value,
             "model": self.model,
             "tools": self.tools,
-            "system_prompt": self.system_prompt
+            "system_prompt": self.system_prompt,
+            "is_one_shot": self.is_one_shot
         }
 
 
 @dataclass
 class SubAgentResult:
+    """Result from a sub-agent execution"""
     agent_id: str
     agent_name: str
     status: str
@@ -62,10 +69,10 @@ class SubAgentResult:
 class SubAgent:
     """Sub-agent with isolated context
 
-    Claude Code 子代理特点:
-    - 独立上下文窗口
-    - 只返回摘要给父代理
-    - 深度限制为 1
+    Claude Code sub-agent characteristics:
+    - Isolated context window
+    - Only returns summary to parent
+    - Depth limit of 1
     """
 
     def __init__(
@@ -107,11 +114,9 @@ Guidelines:
         self.messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
 
     def get_isolated_context(self) -> List[Any]:
-        """Get messages for this agent's isolated context"""
         return self.messages.copy()
 
     def get_summary(self) -> str:
-        """Generate summary for parent agent"""
         if len(self.messages) <= 2:
             return "Agent completed with minimal interaction."
 
@@ -127,7 +132,6 @@ Provide a concise summary (2-3 sentences) suitable for returning to the parent a
         return summary_prompt
 
     async def execute(self, task: str, llm: Any, tools: Optional[List[Any]] = None) -> SubAgentResult:
-        """Execute the sub-agent task"""
         from datetime import datetime as dt
 
         self.status = "running"
@@ -168,10 +172,10 @@ Provide a concise summary (2-3 sentences) suitable for returning to the parent a
 class SubAgentManager:
     """Manages sub-agents for the main agent
 
-    Claude Code 子代理管理:
-    - 跟踪所有活跃子代理
-    - 管理子代理生命周期
-    - 收集和聚合结果
+    Claude Code sub-agent management:
+    - Track all active sub-agents
+    - Manage sub-agent lifecycle
+    - Collect and aggregate results
     """
 
     DEFAULT_AGENTS = {
@@ -179,19 +183,28 @@ class SubAgentManager:
             name="Explorer",
             description="Explore codebase and find relevant files",
             agent_type=SubAgentType.EXPLORE,
-            tools=["Read", "Glob", "Grep"]
+            tools=["Read", "Glob", "Grep"],
+            is_one_shot=True
         ),
         "plan": SubAgentConfig(
             name="Planner",
             description="Plan and analyze complex tasks",
             agent_type=SubAgentType.PLAN,
-            tools=["Read", "Grep"]
+            tools=["Read", "Grep"],
+            is_one_shot=True
         ),
         "general": SubAgentConfig(
             name="GeneralPurpose",
             description="Handle general-purpose multi-step operations",
             agent_type=SubAgentType.GENERAL,
             tools=["Bash", "Read", "Write", "Edit", "Grep", "Glob"]
+        ),
+        "verification": SubAgentConfig(
+            name="Verifier",
+            description="Verify code changes work correctly",
+            agent_type=SubAgentType.VERIFICATION,
+            tools=["Bash", "Read", "Grep"],
+            is_one_shot=True
         )
     }
 
@@ -207,7 +220,6 @@ class SubAgentManager:
         custom_tools: Optional[List[str]] = None,
         parent_context: Optional[Dict[str, Any]] = None
     ) -> SubAgent:
-        """Create a new sub-agent"""
         if agent_config:
             config = agent_config
         elif agent_type:
@@ -230,7 +242,6 @@ class SubAgentManager:
         return agent
 
     def create_from_markdown(self, markdown_content: str) -> Optional[SubAgent]:
-        """Create sub-agent from markdown definition (Claude Code style)"""
         import re
 
         yaml_match = re.search(r'---\n(.*?)\n---', markdown_content, re.DOTALL)
@@ -257,23 +268,27 @@ class SubAgentManager:
         return self.create_sub_agent(agent_config)
 
     def get_agent(self, agent_id: str) -> Optional[SubAgent]:
-        """Get an active agent by ID"""
         return self.active_agents.get(agent_id)
 
     def complete_agent(self, agent_id: str, result: SubAgentResult):
-        """Mark an agent as completed and store result"""
         if agent_id in self.active_agents:
             del self.active_agents[agent_id]
         self.completed_results.append(result)
 
     def get_results(self) -> List[SubAgentResult]:
-        """Get all completed results"""
         return self.completed_results
 
     def clear_results(self):
-        """Clear completed results"""
         self.completed_results = []
 
     def get_active_count(self) -> int:
-        """Get count of active agents"""
         return len(self.active_agents)
+
+
+# Re-export team coordination components
+from agents.team import Coordinator, TeamManager, Worker, WorkerStatus, TaskNotification
+
+__all__ = [
+    "SubAgent", "SubAgentManager", "SubAgentConfig", "SubAgentResult", "SubAgentType",
+    "Coordinator", "TeamManager", "Worker", "WorkerStatus", "TaskNotification"
+]
